@@ -7,6 +7,8 @@ Two streaming speech enhancement models in Swift for Apple silicon, behind one s
 
 However a stream is chunked, both produce the same output as processing it in one piece, and both match their official PyTorch implementations numerically.
 
+The repository also contains **Noise Reduction**, a small menu bar app that adds a virtual microphone with either model in front of your real one, for Zoom, Teams, Meet and any other app that takes a microphone ([below](#mac-app-a-virtual-microphone-for-meetings)).
+
 - RE-USE papers: [One Model, Many Latencies](https://arxiv.org/abs/2606.25621), [Rethinking Training Targets, Architectures and Data Quality for Universal Speech Enhancement](https://arxiv.org/abs/2603.02641); weights [`nvidia/Real-time_RE-USE`](https://huggingface.co/nvidia/Real-time_RE-USE), pinned to revision `4c0c186`
 - DeepFilterNet3: [DeepFilterNet: Perceptually Motivated Real-Time Speech Enhancement](https://arxiv.org/abs/2305.08227); weights from the official [`deepfilternet`](https://github.com/Rikorose/DeepFilterNet) 0.5.6
 
@@ -39,6 +41,34 @@ $CLI enhance-batch noisy/ enhanced/ --engine dfn3       # a whole directory, mod
 ```
 
 RE-USE also uses weights already in the Hugging Face cache, or the directory in `REUSE_MODEL_DIR`. DeepFilterNet3 needs no download.
+
+## Mac app: a virtual microphone for meetings
+
+`App/` is a menu bar app, and `Driver/` is the Audio Server plug-in it installs. Together they add **Noise Reduction Microphone** to the system. Select it in a meeting app, and that app hears your real microphone after enhancement.
+
+- **Runs only while it is used.** The app watches whether any app is recording from the virtual microphone. It opens the real microphone and starts the model only then, so it costs nothing between meetings and the microphone indicator stays off.
+- **No extra clock drift.** The plug-in has two devices on one clock: the visible microphone, and a hidden output the app plays into. A sample the app writes is read back by the microphone at the same sample time. The real microphone does run on its own clock. Against it, the app holds its playback buffer steady by playing one sample more or fewer per callback, interpolated.
+- **Either model.** DeepFilterNet3 is the default: it runs on the CPU and its weights ship with the app. Real-time RE-USE (light / balanced / best, 40 or 120 ms) is downloaded from the menu under NVIDIA's noncommercial license. The selected model is loaded and its kernels are compiled ahead of time, so the pipeline starts in about 0.1 s when a meeting app opens the microphone.
+- **Silence when off.** When the app is off or quit, the virtual microphone passes silence; it never falls back to the raw microphone.
+
+Measured end to end, from a signal entering the input device to the same signal leaving the virtual microphone (M5 Pro, 48 kHz):
+
+| Model | Delay | Matches offline processing of the same input |
+|---|---|---|
+| DeepFilterNet3 | about 73 ms | correlation 0.999 |
+| RE-USE, exit layer 8, 1 frame per call | about 95 ms | correlation 0.986 |
+
+The delay is the algorithmic latency (40 ms for both), the compute margin (15 ms DeepFilterNet3, 30 ms RE-USE) and the device buffers. RE-USE's offline reference was run with the same leading silence, because its output shifts slightly with where the 20 ms frame grid falls. A two-minute live run had no underruns or overruns.
+
+Build it (needs [XcodeGen](https://github.com/yonaskolb/XcodeGen)):
+
+```bash
+make app          # .build/app/Build/Products/Release/Noise Reduction.app, Developer ID signed
+make app SIGN=-   # ad hoc signing, for your own machine
+make dist         # notarized zip for a release (needs a notarytool keychain profile)
+```
+
+Open the app and choose **Install Virtual Microphone…**. It asks for an administrator password, copies the plug-in to `/Library/Audio/Plug-Ins/HAL/` and restarts Core Audio, which interrupts audio for about a second. **More › Uninstall Driver…** reverses this. `App/Tools/` has two command-line checks against the installed devices. One plays a tone through the plug-in and checks that it comes back intact; the other records the virtual microphone the way a meeting app would.
 
 ## Choosing a latency
 
@@ -208,4 +238,5 @@ The convolutions alone are as fast on MPSGraph as on Core ML: the whole stack as
 The code is MIT licensed.
 
 - The RE-USE weights are released by NVIDIA under the [NVIDIA One-Way Noncommercial License (NSCLv1)](https://github.com/NVlabs/HMAR/blob/main/LICENSE), for noncommercial research and development only. This repository does not include them; `download` fetches them on request.
+- The virtual microphone plug-in (`Driver/`) is original code under the same MIT license.
 - The DeepFilterNet3 weights are dual licensed MIT / Apache-2.0 and ship as safetensors in `Sources/EfficientNoiseReduction/Resources/`. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the license text.

@@ -56,6 +56,9 @@ public final class RealtimeEnhancer: @unchecked Sendable {
     public var underruns: Int { flags.withLock { $0.underruns } }
     /// Capture callbacks dropped because the worker fell more than the ring behind.
     public var overruns: Int { flags.withLock { $0.overruns } }
+    /// Enhanced samples queued for `read`. When capture and playback run on different
+    /// clocks, its level drifts; the reader can play slightly more or fewer samples to hold it.
+    public var bufferedOutput: Int { output.count }
 
     /// Queue captured samples. Real-time safe.
     public func write(_ samples: UnsafeBufferPointer<Float>) {
@@ -127,6 +130,8 @@ final class RingBuffer: @unchecked Sendable {
     }
 
     deinit { storage.deallocate() }
+
+    var count: Int { lock.withLock { $0.count } }
 
     /// Append all of `samples`, or nothing if they do not fit.
     func write(_ samples: UnsafeBufferPointer<Float>) -> Bool {
