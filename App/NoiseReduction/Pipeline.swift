@@ -17,6 +17,8 @@ enum PipelineError: LocalizedError {
 /// separate clocks; `PlaybackReader` absorbs the drift between them.
 final class Pipeline {
     let realtime: RealtimeEnhancer
+    /// RMS of the latest captured and played blocks, for the level meters.
+    let levels = Levels()
     private let capture = AVAudioEngine()
     private let playback = AVAudioEngine()
 
@@ -28,7 +30,7 @@ final class Pipeline {
         try capture.inputNode.auAudioUnit.setDeviceID(input)
         let inputFormat = capture.inputNode.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else { throw PipelineError.noInput }
-        let writer = CaptureWriter(realtime, from: inputFormat, to: rate)
+        let writer = CaptureWriter(realtime, levels: levels, from: inputFormat, to: rate)
         let sinkNode = AVAudioSinkNode { _, frames, list in
             writer.push(list, frames: Int(frames))
             return noErr
@@ -38,7 +40,7 @@ final class Pipeline {
 
         try playback.outputNode.auAudioUnit.setDeviceID(sink)
         let mono = AVAudioFormat(standardFormatWithSampleRate: rate, channels: 1)!
-        let reader = PlaybackReader(realtime, sampleRate: rate)
+        let reader = PlaybackReader(realtime, levels: levels, sampleRate: rate)
         let source = AVAudioSourceNode(format: mono) { _, _, frames, list in
             reader.render(list, frames: Int(frames))
             return noErr
@@ -65,12 +67,14 @@ final class Pipeline {
 /// Downmixes capture buffers to mono and converts them to the enhancer's rate.
 private final class CaptureWriter {
     private let realtime: RealtimeEnhancer
+    private let levels: Levels
     private let converter: AVAudioConverter?
     private let mono: AVAudioPCMBuffer
     private let converted: AVAudioPCMBuffer
 
-    init(_ realtime: RealtimeEnhancer, from format: AVAudioFormat, to rate: Double) {
+    init(_ realtime: RealtimeEnhancer, levels: Levels, from format: AVAudioFormat, to rate: Double) {
         self.realtime = realtime
+        self.levels = levels
         let capacity: AVAudioFrameCount = 16384
         let monoIn = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: 1)!
         let monoOut = AVAudioFormat(standardFormatWithSampleRate: rate, channels: 1)!
@@ -98,6 +102,7 @@ private final class CaptureWriter {
             for i in 0 ..< n { out[i] *= scale }
         }
         mono.frameLength = AVAudioFrameCount(n)
+        levels.input = Levels.rms(out, n)
 
         guard let converter else {
             realtime.write(UnsafeBufferPointer(start: out, count: n))
@@ -123,6 +128,7 @@ private final class CaptureWriter {
 /// minimum queue level over a window moves away from where it settled.
 private final class PlaybackReader {
     private let realtime: RealtimeEnhancer
+    private let levels: Levels
     private let scratch = UnsafeMutableBufferPointer<Float>.allocate(capacity: 16384)
     private let window: Int
     private let tolerance: Int
@@ -132,8 +138,9 @@ private final class PlaybackReader {
     private var target: Int?
     private var adjust = 0
 
-    init(_ realtime: RealtimeEnhancer, sampleRate: Double) {
+    init(_ realtime: RealtimeEnhancer, levels: Levels, sampleRate: Double) {
         self.realtime = realtime
+        self.levels = levels
         window = Int(sampleRate)
         tolerance = Int(sampleRate * 0.002)
     }
@@ -144,6 +151,7 @@ private final class PlaybackReader {
         let abl = UnsafeMutableAudioBufferListPointer(list)
         let out = UnsafeMutableBufferPointer(start: abl[0].mData!.assumingMemoryBound(to: Float.self), count: n)
         track(realtime.bufferedOutput, frames: n)
+        defer { levels.output = Levels.rms(out.baseAddress!, n) }
         let m = n + adjust
         guard adjust != 0, n > 1, m <= scratch.count else {
             realtime.read(into: out)
@@ -174,5 +182,31 @@ private final class PlaybackReader {
         }
         windowMin = .max
         windowFrames = 0
+    }
+}
+
+/// Latest block levels, written by the audio threads and polled by the UI. A torn read
+/// of a single aligned Float is not possible on arm64, so no lock is needed.
+final class Levels: @unchecked Sendable {
+    private let storage = UnsafeMutablePointer<Float>.allocate(capacity: 2)
+
+    init() { storage.initialize(repeating: 0, count: 2) }
+    deinit { storage.deallocate() }
+
+    var input: Float {
+        get { storage[0] }
+        set { storage[0] = newValue }
+    }
+
+    var output: Float {
+        get { storage[1] }
+        set { storage[1] = newValue }
+    }
+
+    static func rms(_ x: UnsafePointer<Float>, _ n: Int) -> Float {
+        guard n > 0 else { return 0 }
+        var sum: Float = 0
+        for i in 0 ..< n { sum += x[i] * x[i] }
+        return (sum / Float(n)).squareRoot()
     }
 }

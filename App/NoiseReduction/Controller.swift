@@ -46,11 +46,14 @@ final class Controller {
     private(set) var reuseDownloaded = false
     private(set) var downloading = false
     private(set) var driverOutdated = false
+    /// Both devices of the plug-in are present.
+    private(set) var driverPresent = false
     private(set) var latencyMs: Int?
-    var launchAtLogin: Bool {
-        get { SMAppService.mainApp.status == .enabled }
-        set {
-            try? newValue ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
+    var launchAtLogin = SMAppService.mainApp.status == .enabled {
+        didSet {
+            guard launchAtLogin != (SMAppService.mainApp.status == .enabled) else { return }
+            try? launchAtLogin ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
+            launchAtLogin = SMAppService.mainApp.status == .enabled
         }
     }
 
@@ -137,7 +140,9 @@ final class Controller {
                 }
             }
         }
-        guard let microphone, let sink = AudioSystem.device(uid: VirtualDevice.sinkUID) else {
+        let sink = AudioSystem.device(uid: VirtualDevice.sinkUID)
+        driverPresent = microphone != nil && sink != nil
+        guard let microphone, let sink else {
             stopPipeline()
             status = .driverMissing
             return
@@ -208,6 +213,12 @@ final class Controller {
         }
     }
 
+    /// Input and output levels of the running pipeline (RMS, 0 when idle).
+    var levels: (input: Float, output: Float) {
+        guard let levels = pipeline?.levels else { return (0, 0) }
+        return (levels.input, levels.output)
+    }
+
     /// Loads the selected model and compiles its kernels ahead of time, so the pipeline
     /// starts within a fraction of a second when a meeting app opens the microphone.
     private func preload() {
@@ -259,3 +270,15 @@ private final class ModelCache: @unchecked Sendable {
         }
     }
 }
+
+#if DEBUG
+extension Controller {
+    /// Puts the controller in a given state for UI snapshots.
+    func preview(status: Status, latencyMs: Int? = nil, driverPresent: Bool = true) {
+        self.status = status
+        self.latencyMs = latencyMs
+        self.driverPresent = driverPresent
+        driverOutdated = false
+    }
+}
+#endif
