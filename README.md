@@ -60,13 +60,15 @@ Measured end to end, from a signal entering the input device to the same signal 
 
 The delay is the algorithmic latency (40 ms for both), the compute margin (15 ms DeepFilterNet3, 30 ms RE-USE) and the device buffers. RE-USE's offline reference was run with the same leading silence, because its output shifts slightly with where the 20 ms frame grid falls. A two-minute live run had no underruns or overruns.
 
-Build it (needs [XcodeGen](https://github.com/yonaskolb/XcodeGen)):
+Download the signed and notarized app from [Releases](https://github.com/JacobLinCool/apple-efficient-noise-reduction/releases), or build it (needs [XcodeGen](https://github.com/yonaskolb/XcodeGen)):
 
 ```bash
 make app          # .build/app/Build/Products/Release/Noise Reduction.app, Developer ID signed
 make app SIGN=-   # ad hoc signing, for your own machine
-make dist         # notarized zip for a release (needs a notarytool keychain profile)
+make dist         # notarized zip (needs `xcrun notarytool store-credentials notary`)
 ```
+
+Pushing a version tag runs `.github/workflows/release.yml`, which does the same on a GitHub runner and attaches the zip to the release.
 
 Open the app and choose **Install Virtual Microphone…**. It asks for an administrator password, copies the plug-in to `/Library/Audio/Plug-Ins/HAL/` and restarts Core Audio, which interrupts audio for about a second. **More › Uninstall Driver…** reverses this. `App/Tools/` has two command-line checks against the installed devices. One plays a tone through the plug-in and checks that it comes back intact; the other records the virtual microphone the way a meeting app would.
 

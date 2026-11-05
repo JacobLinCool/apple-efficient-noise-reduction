@@ -28,21 +28,26 @@ golden:
 APP_DERIVED := .build/app
 APP := $(APP_DERIVED)/Build/Products/Release/Noise Reduction.app
 SIGN ?= Developer ID Application
+# Release builds pass the tag and a build number; the app reinstalls the driver when
+# the build number changes.
+VERSION_FLAGS := $(if $(VERSION),MARKETING_VERSION=$(VERSION)) $(if $(BUILD),CURRENT_PROJECT_VERSION=$(BUILD))
 
 app:
 	cd App && xcodegen generate --quiet
 	xcodebuild -project App/NoiseReduction.xcodeproj -scheme NoiseReduction -configuration Release \
 		-destination 'platform=macOS,arch=arm64' -derivedDataPath $(APP_DERIVED) \
-		SIGN_IDENTITY="$(SIGN)" build -quiet
+		SIGN_IDENTITY="$(SIGN)" $(VERSION_FLAGS) build -quiet
 	@echo "built $(APP)"
 
-# Notarized zip for a GitHub release; needs `xcrun notarytool store-credentials $(NOTARY_PROFILE)`.
-NOTARY_PROFILE ?= notary
+# Notarized zip for a GitHub release. Authenticates with the keychain profile made by
+# `xcrun notarytool store-credentials notary`; CI passes an API key in NOTARY_AUTH instead.
+NOTARY_AUTH ?= --keychain-profile notary
 DIST := .build/NoiseReduction.zip
 
 dist: app
 	ditto -c -k --keepParent "$(APP)" $(DIST)
-	xcrun notarytool submit $(DIST) --keychain-profile $(NOTARY_PROFILE) --wait
+	xcrun notarytool submit $(DIST) $(NOTARY_AUTH) --wait
 	xcrun stapler staple "$(APP)"
+	spctl --assess --type execute --verbose=2 "$(APP)"
 	ditto -c -k --keepParent "$(APP)" $(DIST)
 	@echo "notarized $(DIST)"
