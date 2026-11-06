@@ -12,26 +12,43 @@ struct NoiseReductionCLI: AsyncParsableCommand {
 }
 
 enum Engine: String, ExpressibleByArgument, CaseIterable {
-    case reuse, dfn3
+    case reuse, dfn3, nemotron
 }
 
 struct ModelOptions: ParsableArguments {
-    @Option(help: "Enhancement model: reuse (Real-time RE-USE, GPU) or dfn3 (DeepFilterNet3, CPU, 48 kHz).")
+    @Option(help: "Enhancement model: reuse (Real-time RE-USE, GPU), nemotron (NemotronLabs RE-USE, GPU, chunked) or dfn3 (DeepFilterNet3, CPU, 48 kHz).")
     var engine: Engine = .reuse
 
-    @Option(help: "RE-USE weights directory with config.json and model.safetensors (default: REUSE_MODEL_DIR or the Hugging Face cache).")
+    @Option(help: "Weights directory with config.json and model.safetensors (default: REUSE_MODEL_DIR / NEMOTRON_MODEL_DIR or the Hugging Face cache).")
     var model: String?
 
-    @Flag(help: "RE-USE: full float32 matmuls instead of TF32 on M5-class GPUs (slower; matches PyTorch to ~2e-6).")
+    @Flag(help: "RE-USE models: full float32 instead of float16 / TF32 (slower; matches PyTorch closely).")
     var exact = false
 
-    func load() throws -> ReUseModel {
-        let dir = try model.map { URL(filePath: $0) } ?? ModelLocator.locate()
-        return try ReUseModel(directory: dir, precision: exact ? .exact : .fast)
+    @Option(help: "RE-USE models: run at this sample rate, resampling the input first. Above the input's rate this is bandwidth extension (NVIDIA's --BWE): the model restores the missing high band, e.g. 16 kHz in, --output-rate 48000 out.")
+    var outputRate: Int?
+
+    var precision: ReUseModel.Precision { exact ? .exact : .fast }
+
+    func validate() throws {
+        if engine == .dfn3, let r = outputRate, r != DeepFilterNet3.sampleRate {
+            throw ValidationError("DeepFilterNet3 runs at 48 kHz only and does not restore missing bands")
+        }
     }
 
-    /// The sample rate the engine runs at for `rate` input: RE-USE takes any rate, DFN3 48 kHz.
-    func runRate(for rate: Int) -> Int { engine == .dfn3 ? DeepFilterNet3.sampleRate : rate }
+    func load() throws -> ReUseModel {
+        let dir = try model.map { URL(filePath: $0) } ?? ModelLocator.locate(.realtimeReUse)
+        return try ReUseModel(directory: dir, precision: precision)
+    }
+
+    func loadNemotron() throws -> NemotronModel {
+        let dir = try model.map { URL(filePath: $0) } ?? ModelLocator.locate(.nemotron)
+        return try NemotronModel(directory: dir, precision: precision)
+    }
+
+    /// The sample rate the engine runs at for `rate` input: DFN3 48 kHz; the RE-USE models
+    /// take any rate, the input's unless `--output-rate` asks for another.
+    func runRate(for rate: Int) -> Int { engine == .dfn3 ? DeepFilterNet3.sampleRate : outputRate ?? rate }
 
     /// Loads the model once; the returned closure makes a fresh stream per call.
     func factory(latency: LatencyOptions) throws -> (Int) throws -> any SpeechEnhancer {
@@ -40,6 +57,10 @@ struct ModelOptions: ParsableArguments {
             let m = try load()
             let config = latency.configuration
             return { try StreamingEnhancer(model: m, sampleRate: $0, configuration: config) }
+        case .nemotron:
+            let m = try loadNemotron()
+            let chunking = latency.nemotronChunking
+            return { NemotronEnhancer(model: m, sampleRate: $0, chunking: chunking) }
         case .dfn3:
             let m = try DeepFilterNet3()
             // 10 ms hops; 40 ms of window and look-ahead before the chunk buffering.
@@ -66,14 +87,29 @@ struct LatencyOptions: ParsableArguments {
     @Option(name: .shortAndLong, help: "RE-USE look-ahead frames, 0-2: each adds 20 ms of algorithmic latency.")
     var lookAhead = 0
 
-    @Option(help: "Latency budget in seconds; sets the chunk size (e.g. 0.5).")
+    @Option(help: "Latency budget in seconds; sets the chunk size (e.g. 0.5). NemotronLabs RE-USE: the chunk length (default 5).")
     var latency: Double?
+
+    @Option(help: "NemotronLabs RE-USE: hop between chunks as a fraction of the chunk (NVIDIA's hop_length_portion).")
+    var hop = 0.5
+
+    @Flag(help: "NemotronLabs RE-USE: one pass over the whole file (NVIDIA's inference.py; short clips only).")
+    var whole = false
 
     @Option(help: "Frames per network call (RE-USE 20 ms hops, DFN3 10 ms); overrides --latency.")
     var frames: Int?
 
     @Flag(help: "Whole-file processing in the largest chunks that keep memory near 1-2 GB.")
     var offline = false
+
+    func validate() throws {
+        guard hop > 0 && hop <= 1 else { throw ValidationError("--hop must be in (0, 1]") }
+        if let latency, latency <= 0 { throw ValidationError("--latency must be positive") }
+    }
+
+    var nemotronChunking: NemotronEnhancer.Chunking {
+        whole ? .whole : .chunks(seconds: latency ?? 5, hop: hop)
+    }
 
     var configuration: EnhancerConfiguration {
         let chunk: EnhancerConfiguration.Chunk =
@@ -191,6 +227,12 @@ struct Bench: ParsableCommand {
     @Option(help: "Look-ahead frames.")
     var lookAhead = 0
 
+    @Option(parsing: .upToNextOption, help: "NemotronLabs RE-USE: chunk lengths in seconds.")
+    var chunkSeconds = [1.0, 2.0, 5.0]
+
+    @Option(help: "NemotronLabs RE-USE: hop between chunks as a fraction of the chunk.")
+    var hop = 0.5
+
     func run() throws {
         let rate = model.runRate(for: sampleRate)
         // Speech-like test signal: noise bursts with a pitch-modulated tone.
@@ -204,6 +246,8 @@ struct Bench: ParsableCommand {
         // One loaded model per engine; a fresh stream per setting.
         let make: (Int, Int) throws -> any SpeechEnhancer
         let layers: [Int]
+        var settings = chunks
+        var label: (Int) -> String = { $0 == 0 ? "offline" : "\($0)" }
         switch model.engine {
         case .reuse:
             let m = try model.load()
@@ -217,11 +261,19 @@ struct Bench: ParsableCommand {
             let m = try DeepFilterNet3()
             layers = [0]
             make = { _, chunk in DeepFilterNet3Enhancer(model: m, chunkFrames: chunk == 0 ? 100 : chunk) }
+        case .nemotron:
+            let m = try model.loadNemotron()
+            layers = [0]
+            settings = Array(chunkSeconds.indices)
+            label = { [chunkSeconds] in String(format: "%gs", chunkSeconds[$0]) }
+            make = { [chunkSeconds, hop] _, i in
+                NemotronEnhancer(model: m, sampleRate: rate, chunking: .chunks(seconds: chunkSeconds[i], hop: hop))
+            }
         }
         print("\(model.engine.rawValue), \(rate) Hz, \(seconds) s per setting, look-ahead \(lookAhead)")
         print("exit  frames/call  latency(ms)  compute/call ms (mean / p95 / max)  RTF      total latency p95 (ms)")
         for layer in layers {
-            for chunk in chunks {
+            for chunk in settings {
                 // Warm up kernels and shapes on a fresh stream.
                 let warm = try make(layer, chunk)
                 warm.warmUp()
@@ -236,11 +288,14 @@ struct Bench: ParsableCommand {
                     var i = 0
                     while i < n {
                         let k = min(block, n - i)
+                        let before = (e as? NemotronEnhancer)?.chunksProcessed
                         let t0 = ContinuousClock.now
                         let out = e.process(UnsafeBufferPointer(rebasing: buf[i ..< i + k]))
                         let dt = (ContinuousClock.now - t0).seconds
                         total += dt
-                        if !out.isEmpty { times.append(dt) }
+                        // A call that ran the network: NemotronLabs RE-USE also emits between chunks.
+                        let ran = before.map { $0 != (e as! NemotronEnhancer).chunksProcessed } ?? !out.isEmpty
+                        if ran { times.append(dt) }
                         i += k
                     }
                     let t0 = ContinuousClock.now
@@ -253,9 +308,9 @@ struct Bench: ParsableCommand {
                 print(
                     String(
                         format: "%4@  %11@  %11.0f  %10.3f / %6.3f / %6.3f          %.4f   %@",
-                        model.engine == .reuse ? "\(layer)" : "-", chunk == 0 ? "offline" : "\(chunk)",
+                        model.engine == .reuse ? "\(layer)" : "-", label(chunk),
                         e.latencySeconds * 1000, mean * 1000, p95 * 1000, (times.last ?? 0) * 1000, total / seconds,
-                        chunk == 0 ? "-" : String(format: "%.0f", (e.latencySeconds + p95) * 1000)))
+                        chunk == 0 && model.engine != .nemotron ? "-" : String(format: "%.0f", (e.latencySeconds + p95) * 1000)))
             }
         }
     }
@@ -263,14 +318,23 @@ struct Bench: ParsableCommand {
 
 struct Download: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Download nvidia/Real-time_RE-USE (NVIDIA One-Way Noncommercial License).")
+        abstract: "Download RE-USE weights: Real-time RE-USE (NVIDIA noncommercial license) or NemotronLabs RE-USE (OpenMDW).")
 
-    @Option(help: "Destination directory.")
-    var to = ModelLocator.defaultDirectory.path
+    @Option(help: "Which weights: reuse (nvidia/Real-time_RE-USE) or nemotron (nvidia/NVIDIA-NemotronLabs-RE-USE).")
+    var engine: Engine = .reuse
+
+    @Option(help: "Destination directory (default: under ~/Library/Application Support/EfficientNoiseReduction).")
+    var to: String?
 
     func run() async throws {
-        let dir = try await ModelLocator.download(to: URL(filePath: to))
-        print("downloaded to \(dir.path)")
+        let model: HubModel
+        switch engine {
+        case .reuse: model = .realtimeReUse
+        case .nemotron: model = .nemotron
+        case .dfn3: throw ValidationError("DeepFilterNet3's weights ship with the package")
+        }
+        let dir = try await ModelLocator.download(model, to: to.map { URL(filePath: $0) })
+        print("downloaded \(model.repository) to \(dir.path)")
     }
 }
 

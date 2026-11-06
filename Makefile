@@ -18,10 +18,11 @@ bench: build
 	$(CLI) bench --sample-rate 48000
 
 # Golden test data from NVIDIA's and DeepFilterNet's reference code (needs uv; the
-# RE-USE weights are downloaded under NVIDIA's noncommercial license). Not committed.
+# RE-USE weights are downloaded under their licenses). Not committed.
 golden:
 	uv run reference/golden.py
 	uv run reference/golden_dfn3.py
+	uv run reference/golden_nemotron.py
 
 # Menu bar app with the virtual microphone driver (needs XcodeGen). Signs with Developer ID
 # by default; `make app SIGN=-` signs ad hoc for local use.

@@ -13,7 +13,8 @@ import MLX
 ///     out      = out_proj(y * silu(z))
 ///
 /// `MambaGroup` holds one or two Mambas that read the same input: the causal time Mamba
-/// of a block, or the forward and backward frequency Mambas, which run as one batch.
+/// of a block, or the forward and backward Mambas of a bidirectional block (along
+/// frequency, or along time in the offline model), which run as one batch.
 /// Per call that is two GEMMs and two Metal kernels per group, plus the output GEMM that
 /// the caller folds into its own projection.
 struct MambaGroup {
@@ -33,10 +34,17 @@ struct MambaGroup {
     let D: MLXArray  // (dirs, Di)
     /// out_proj of each direction, (Di, C); the caller folds it into its projection.
     let outProj: [MLXArray]
+    /// The scan writes `y / outputScale`. A power of two, so float16 rounding is
+    /// unchanged except for values that become subnormal (|y| below about 4e-3 at 64,
+    /// an absolute error near 4e-6); it moves large outputs (the offline model's reach
+    /// 1e4) away from float16's 65504 limit. The caller's projection scales the other
+    /// terms to match.
+    let outputScale: Int
 
     /// `dtype` is the storage type of activations and GEMM weights; the per-channel
     /// scan parameters and the SSM state stay float32.
-    init(_ w: Weights, prefixes: [String], dtype: DType) throws {
+    init(_ w: Weights, prefixes: [String], dtype: DType, outputScale: Int = 1) throws {
+        self.outputScale = outputScale
         func stack(_ f: (String) throws -> MLXArray) throws -> MLXArray { stacked(try prefixes.map(f)) }
         directions = prefixes.count
         inProj = concatenated(try prefixes.map { try w.linear("\($0).in_proj.weight") }, axis: 1).asType(dtype)
@@ -68,41 +76,51 @@ struct MambaGroup {
     func time(_ u: MLXArray, state: inout State) -> MLXArray {
         let (T, F) = (u.dim(0), u.dim(1))
         let xz = linear(u.asType(inProj.dtype), inProj)
-        let xs = MambaKernels.convSilu(xz, weight: convWeight, bias: convBias, dInner: dInner, cache: state.conv)
+        let xs = MambaKernels.convSilu(xz, weight: convWeight, bias: convBias, dInner: dInner, axis: .time, cache: state.conv)
         let x = xz[.ellipsis, ..<dInner]
         state.conv = detached(T >= kConv - 1 ? x[(T - kConv + 1)...] : concatenated([state.conv, x])[T...])
         let dbl = matmul(xs, xProj)
-        let (y, h) = MambaKernels.scan(xs: xs, xz: xz, dbl: dbl, group: self, frames: T, bins: F, h0: state.ssm)
+        let (y, h) = MambaKernels.scan(xs: xs, xz: xz, dbl: dbl, group: self, frames: T, bins: F, axis: .time, h0: state.ssm)
         state.ssm = h!
         return y
     }
 
     /// Forward and backward Mamba along frequency within each frame. Returns both gated
     /// scan outputs, (T, F, 2·Di) direction-major per position, before out_proj.
-    func freq(_ u: MLXArray) -> MLXArray {
+    func freq(_ u: MLXArray) -> MLXArray { bidirectional(u, axis: .freq) }
+
+    /// Forward and backward Mamba along time over a whole chunk (the offline model).
+    /// Same output layout as `freq`.
+    func timeBidirectional(_ u: MLXArray) -> MLXArray { bidirectional(u, axis: .time) }
+
+    private func bidirectional(_ u: MLXArray, axis: MambaKernels.Axis) -> MLXArray {
         let (T, F) = (u.dim(0), u.dim(1))
         let xz = linear(u.asType(inProj.dtype), inProj)
-        let xs = MambaKernels.convSilu(xz, weight: convWeight, bias: convBias, dInner: dInner, cache: nil)
+        let xs = MambaKernels.convSilu(xz, weight: convWeight, bias: convBias, dInner: dInner, axis: axis)
         let dbl = matmul(xs, xProj)
-        return MambaKernels.scan(xs: xs, xz: xz, dbl: dbl, group: self, frames: T, bins: F, h0: nil).y
+        return MambaKernels.scan(xs: xs, xz: xz, dbl: dbl, group: self, frames: T, bins: F, axis: axis, h0: nil).y
     }
 }
 
 /// Metal kernels for the parts of Mamba between GEMMs. Rows are (t, f) positions in
 /// row-major order; `xz` is the in_proj output, (T, F, dirs·2·Di) holding each
-/// direction's x then z. With a cache the kernels run along time (the stateful causal
-/// Mamba); without, along frequency, where direction 1 runs in reverse.
+/// direction's x then z. The kernels run along `axis`; direction 1 of a bidirectional
+/// group runs in reverse. Along time with a cache they continue a causal stream.
 enum MambaKernels {
+    enum Axis { case time, freq }
+
     /// silu(depthwise conv of x), output (dirs, rows, Di). Along time, `cache` holds the
-    /// K-1 frames before this chunk.
-    static func convSilu(_ xz: MLXArray, weight: MLXArray, bias: MLXArray, dInner: Int, cache: MLXArray?)
-        -> MLXArray
-    {
+    /// K-1 frames before this chunk (causal streaming); without it the sequence starts
+    /// at the chunk (bidirectional over a whole chunk).
+    static func convSilu(
+        _ xz: MLXArray, weight: MLXArray, bias: MLXArray, dInner: Int, axis: Axis, cache: MLXArray? = nil
+    ) -> MLXArray {
         let (T, F) = (xz.dim(0), xz.dim(1))
         let dirs = weight.dim(0), rows = T * F
         let params = MLXArray([Int32(dInner), Int32(T), Int32(F), Int32(xz.dim(2))])
         let inputs: [MLXArray] = [xz, weight, bias, params] + (cache.map { [$0] } ?? [])
-        return (cache == nil ? convFreq : convTime)(
+        let kernel = axis == .freq ? convFreq : cache != nil ? convTime : convTimeBidirectional
+        return kernel(
             inputs, template: [("OutT", xz.dtype)], grid: (dInner, rows, dirs), threadGroup: (min(256, dInner), 1, 1),
             outputShapes: [[dirs, rows, dInner]], outputDTypes: [xz.dtype])[0]
     }
@@ -126,6 +144,16 @@ enum MambaKernels {
             out[(dir * T * F + row) * Di + d] = OutT(acc / (1.0f + metal::exp(-acc)));
             """)
 
+    private static let convTimeBidirectional = MLXFast.metalKernel(
+        name: "reuse_conv_silu_time_bidirectional",
+        inputNames: ["xz", "weight", "bias", "params"], outputNames: ["out"],
+        source: convBody + """
+                int tt = dir == 0 ? t - 3 + k : t + 3 - k;
+                if (tt >= 0 && tt < T) acc += w[k] * xz[(tt * F + f) * S + dir * 2 * Di + d];
+            }
+            out[(dir * T * F + row) * Di + d] = OutT(acc / (1.0f + metal::exp(-acc)));
+            """)
+
     private static let convTime = MLXFast.metalKernel(
         name: "reuse_conv_silu_time",
         inputNames: ["xz", "weight", "bias", "params", "cache"], outputNames: ["out"],
@@ -143,11 +171,12 @@ enum MambaKernels {
     /// SIMD group advances its own channel, and the B and C rows it reads are the same for
     /// the whole group, so their loads are broadcast.
     static func scan(
-        xs: MLXArray, xz: MLXArray, dbl: MLXArray, group g: MambaGroup, frames T: Int, bins F: Int, h0: MLXArray?
+        xs: MLXArray, xz: MLXArray, dbl: MLXArray, group g: MambaGroup, frames T: Int, bins F: Int, axis: Axis,
+        h0: MLXArray?
     ) -> (y: MLXArray, h: MLXArray?) {
         let Di = g.dInner, dirs = g.directions, rows = T * F
         // Time: one sequence per bin, stepping a frame (F rows). Frequency: one per frame.
-        let (sequences, length, strideB, strideL) = h0 != nil ? (F, T, 1, F) : (T, F, F, 1)
+        let (sequences, length, strideB, strideL) = axis == .time ? (F, T, 1, F) : (T, F, F, 1)
         let params = MLXArray([
             Int32(Di), Int32(length), Int32(strideB), Int32(strideL), Int32(rows), Int32(xz.dim(2)),
             Int32(dbl.dim(2)), Int32(dirs),
@@ -157,12 +186,12 @@ enum MambaKernels {
         let yShape = [T, F, dirs * Di]
         if let h0 {
             let out = scanState(
-                inputs + [h0], template: [("OutT", xs.dtype)], grid: grid, threadGroup: (min(256, Di), 1, 1),
+                inputs + [h0], template: [("OutT", xs.dtype), ("YSCALE", g.outputScale)], grid: grid, threadGroup: (min(256, Di), 1, 1),
                 outputShapes: [yShape, h0.shape], outputDTypes: [xs.dtype, .float32])
             return (out[0], out[1])
         }
         let out = scanPlain(
-            inputs, template: [("OutT", xs.dtype)], grid: grid, threadGroup: (min(256, Di), 1, 1),
+            inputs, template: [("OutT", xs.dtype), ("YSCALE", g.outputScale)], grid: grid, threadGroup: (min(256, Di), 1, 1),
             outputShapes: [yShape], outputDTypes: [xs.dtype])
         return (out[0], nil)
     }
@@ -205,7 +234,7 @@ enum MambaKernels {
                     }
                 }
                 float zv = xz[row * S + int(dir) * 2 * Di + Di + d];
-                y[(row * dirs + int(dir)) * Di + d] = OutT((acc + skip * xv) * zv / (1.0f + metal::exp(-zv)));
+                y[(row * dirs + int(dir)) * Di + d] = OutT((acc + skip * xv) * zv / (1.0f + metal::exp(-zv)) * (1.0f / float(YSCALE)));
             }
             \(stateful ? "for (int n = 0; n < 16; ++n) hT[gid * 16 + n] = h[n];" : "")
         """

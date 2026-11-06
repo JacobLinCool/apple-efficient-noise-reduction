@@ -20,6 +20,10 @@ enum Snapshots {
                 controller.model = .reuse
                 controller.preview(status: .active(input: "MacBook Pro Microphone"), latencyMs: 70)
             }),
+            ("4b-nemotron", {
+                controller.model = .nemotron
+                controller.preview(status: .active(input: "MacBook Pro Microphone"), latencyMs: 1400)
+            }),
             ("5-off", { controller.enabled = false; controller.preview(status: .off) }),
             ("6-failed", {
                 controller.enabled = true

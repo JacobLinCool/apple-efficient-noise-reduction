@@ -35,7 +35,7 @@ public final class ReUseModel: @unchecked Sendable {
     public init(directory: URL, precision: Precision = .fast) throws {
         self.precision = precision
         setenv("MLX_ENABLE_TF32", precision == .fast ? "1" : "0", 0)
-        Memory.cacheLimit = 256 << 20
+        BufferCache.require(256 << 20)
         config = try JSONDecoder().decode(ModelConfig.self, from: Data(contentsOf: directory.appending(path: "config.json")))
         guard config.model.compressFactor == "relu_log1p" else {
             throw EnhancementError.invalidConfiguration("unsupported compress_factor \(config.model.compressFactor)")
@@ -262,6 +262,22 @@ public final class StreamingEnhancer: SpeechEnhancer {
             olaStart += drop
         }
         return out
+    }
+}
+
+/// MLX's buffer cache is process-wide and unbounded by default: freed activations are
+/// kept for reuse, and inputs of varying length (one buffer size per file) grow the
+/// process by gigabytes. Each model asks for the cache it needs; the limit is the largest
+/// request so far, so loading one model never shrinks another's.
+enum BufferCache {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var limit = 0
+
+    static func require(_ bytes: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        limit = max(limit, bytes)
+        Memory.cacheLimit = limit
     }
 }
 

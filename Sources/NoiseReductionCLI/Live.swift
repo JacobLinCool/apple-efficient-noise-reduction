@@ -20,8 +20,21 @@ struct Live: ParsableCommand {
     @Flag(help: "Play the enhanced audio on the default output device.")
     var monitor = false
 
-    @Option(help: "Silence queued ahead of the first output to absorb compute jitter, seconds.")
-    var margin = 0.03
+    @Option(help: "Silence queued ahead of the first output to absorb compute time, seconds (default: 0.03, or for NemotronLabs RE-USE 0.15 + a quarter of the chunk).")
+    var margin: Double?
+
+    var effectiveMargin: Double {
+        if let margin { return margin }
+        guard model.engine == .nemotron else { return 0.03 }
+        // A whole chunk is computed at once: a few hundred ms per second of 48 kHz audio.
+        return 0.15 + 0.25 * (latency.latency ?? 5)
+    }
+
+    func validate() throws {
+        if model.engine == .nemotron && latency.whole {
+            throw ValidationError("--whole waits for the end of the stream; use --latency for live NemotronLabs RE-USE")
+        }
+    }
 
     func run() throws {
         let engine = AVAudioEngine()
@@ -36,7 +49,7 @@ struct Live: ParsableCommand {
             onOutput = { block in recorded.withLock { $0 += block } }
         }
         let rt = RealtimeEnhancer(
-            try model.makeEnhancer(sampleRate: rate, latency: latency), margin: margin, onOutput: onOutput)
+            try model.makeEnhancer(sampleRate: rate, latency: latency), margin: effectiveMargin, onOutput: onOutput)
 
         let channels = Int(inputFormat.channelCount)
         let scratch = UnsafeMutableBufferPointer<Float>.allocate(capacity: 1 << 16)

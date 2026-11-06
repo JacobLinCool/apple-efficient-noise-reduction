@@ -100,14 +100,20 @@ struct TFBlock {
         let bias: MLXArray
         let normWeight: MLXArray
         let normBias: MLXArray
+        /// The scan's `outputScale`: the projection is computed divided by it (scan output
+        /// pre-divided, input term and bias divided here) and the norm kernel multiplies it
+        /// back in float32. LayerNorm makes the result exact.
+        let scale: Int
 
-        init(_ w: Weights, prefix p: String, outProj: [MLXArray], dtype: DType) throws {
+        init(_ w: Weights, prefix p: String, outProj: [MLXArray], dtype: DType, scale: Int = 1) throws {
             let wp = try w.linear("\(p).output_proj.weight")  // (dirs·C, C)
             let c = wp.dim(1)
             let parts = outProj.indices.map { wp[($0 * c) ..< (($0 + 1) * c)] }
+            self.scale = scale
+            let inverse = 1 / Float(scale)
             fromScan = concatenated(zip(outProj, parts).map { matmul($0, $1) }).asType(dtype)
-            fromInput = parts.dropFirst().reduce(parts[0], +).asType(dtype)
-            bias = try w.raw("\(p).output_proj.bias").asType(dtype)
+            fromInput = (parts.dropFirst().reduce(parts[0], +) * inverse).asType(dtype)
+            bias = (try w.raw("\(p).output_proj.bias") * inverse).asType(dtype)
             normWeight = try w.raw("\(p).norm.weight").asType(dtype)
             normBias = try w.raw("\(p).norm.bias").asType(dtype)
         }
@@ -116,7 +122,7 @@ struct TFBlock {
             let rows = x.reshaped(-1, x.dim(-1))
             // The residual stream stays float32; only the GEMMs run in the storage type.
             let p = addMM(addMM(bias, rows.asType(fromInput.dtype), fromInput), y.reshaped(rows.dim(0), -1), fromScan)
-            return ResidualNorm.run(x: rows, p: p, weight: normWeight, bias: normBias).reshaped(x.shape)
+            return ResidualNorm.run(x: rows, p: p, weight: normWeight, bias: normBias, scale: scale).reshaped(x.shape)
         }
     }
 
@@ -131,7 +137,7 @@ struct TFBlock {
                 uint lane = thread_position_in_grid.x, row = thread_position_in_grid.y;
                 if (int(row) >= rows[0]) return;
                 uint i = row * 64 + lane * 2;
-                float a0 = float(p[i]), a1 = float(p[i + 1]);
+                float a0 = float(p[i]) * float(PSCALE), a1 = float(p[i + 1]) * float(PSCALE);
                 float mean = simd_sum(a0 + a1) / 64.0f;
                 float d0 = a0 - mean, d1 = a1 - mean;
                 float inv = metal::rsqrt(simd_sum(d0 * d0 + d1 * d1) / 64.0f + 1e-5f);
@@ -139,11 +145,12 @@ struct TFBlock {
                 out[i + 1] = OutT(float(x[i + 1]) + d1 * inv * float(gamma[lane * 2 + 1]) + float(beta[lane * 2 + 1]));
             """)
 
-        static func run(x: MLXArray, p: MLXArray, weight: MLXArray, bias: MLXArray) -> MLXArray {
+        static func run(x: MLXArray, p: MLXArray, weight: MLXArray, bias: MLXArray, scale: Int) -> MLXArray {
             precondition(x.dim(-1) == 64)
             let rows = x.dim(0)
             return kernel(
-                [x, p, weight, bias, MLXArray([Int32(rows)])], template: [("OutT", x.dtype)], grid: (32, rows, 1),
+                [x, p, weight, bias, MLXArray([Int32(rows)])], template: [("OutT", x.dtype), ("PSCALE", scale)],
+                grid: (32, rows, 1),
                 threadGroup: (32, 8, 1), outputShapes: [x.shape], outputDTypes: [x.dtype])[0]
         }
     }

@@ -6,13 +6,23 @@ import ServiceManagement
 import os
 
 enum EnhancementModel: String, CaseIterable, Identifiable {
-    case deepFilterNet3, reuse
+    case deepFilterNet3, reuse, nemotron
     var id: Self { self }
 
     var title: String {
         switch self {
         case .deepFilterNet3: "DeepFilterNet3"
         case .reuse: "Real-time RE-USE"
+        case .nemotron: "NemotronLabs RE-USE"
+        }
+    }
+
+    /// Weights downloaded on request; DeepFilterNet3's ship with the app.
+    var hub: HubModel? {
+        switch self {
+        case .deepFilterNet3: nil
+        case .reuse: .realtimeReUse
+        case .nemotron: .nemotron
         }
     }
 }
@@ -38,13 +48,16 @@ final class Controller {
     var reuseDepth: Int { didSet { save(); update(restart: true); preload() } }
     /// RE-USE frames per network call (20 ms each).
     var reuseFrames: Int { didSet { save(); update(restart: true); preload() } }
+    /// NemotronLabs RE-USE chunk length in seconds: its latency.
+    var nemotronChunk: Double { didSet { save(); update(restart: true); preload() } }
 
     private(set) var status: Status = .off {
         didSet { if status != oldValue { log.notice("status: \(String(describing: self.status), privacy: .public)") } }
     }
     private(set) var inputs: [AudioDevice] = []
-    private(set) var reuseDownloaded = false
-    private(set) var downloading = false
+    /// Models whose weights are on disk.
+    private(set) var downloaded: Set<EnhancementModel> = [.deepFilterNet3]
+    private(set) var downloading: EnhancementModel?
     private(set) var driverOutdated = false
     /// Both devices of the plug-in are present.
     private(set) var driverPresent = false
@@ -73,6 +86,7 @@ final class Controller {
         model = defaults.string(forKey: "model").flatMap(EnhancementModel.init) ?? .deepFilterNet3
         reuseDepth = defaults.object(forKey: "reuseDepth") as? Int ?? 8
         reuseFrames = defaults.object(forKey: "reuseFrames") as? Int ?? 1
+        nemotronChunk = defaults.object(forKey: "nemotronChunk") as? Double ?? 1
         let system = AudioObjectID(kAudioObjectSystemObject)
         listeners = [
             AudioSystem.observe(system, kAudioHardwarePropertyDevices) { [weak self] in self?.update(restart: false) },
@@ -108,13 +122,13 @@ final class Controller {
         do { try DriverInstaller.uninstall() } catch { status = .failed(error.localizedDescription) }
     }
 
-    func downloadReUse() {
-        guard !downloading else { return }
-        downloading = true
+    func download(_ model: EnhancementModel) {
+        guard downloading == nil, let hub = model.hub else { return }
+        downloading = model
         Task {
-            defer { downloading = false }
+            defer { downloading = nil }
             do {
-                _ = try await ModelLocator.download(to: ModelLocator.defaultDirectory)
+                _ = try await ModelLocator.download(hub)
                 update(restart: true)
                 preload()
             } catch {
@@ -128,7 +142,7 @@ final class Controller {
     /// Re-reads the devices and starts or stops the pipeline to match the settings.
     private func update(restart: Bool) {
         inputs = AudioSystem.inputDevices()
-        reuseDownloaded = (try? ModelLocator.locate()) != nil
+        downloaded = Set(EnhancementModel.allCases.filter { m in m.hub.map { (try? ModelLocator.locate($0)) != nil } ?? true })
         driverOutdated = DriverInstaller.isOutdated
 
         let microphone = AudioSystem.device(uid: VirtualDevice.microphoneUID)
@@ -177,7 +191,7 @@ final class Controller {
             return
         }
         status = .starting
-        let model = model, depth = reuseDepth, frames = reuseFrames, models = models, generation = generation
+        let model = model, settings = settings, models = models, generation = generation
         startTask = Task {
             guard await AVCaptureDevice.requestAccess(for: .audio) else {
                 startTask = nil
@@ -187,11 +201,8 @@ final class Controller {
             let begin = ContinuousClock.now
             let result = await Task.detached(priority: .userInitiated) {
                 Result {
-                    let enhancer = try models.enhancer(model, depth: depth, frames: frames)
-                    // DFN3 computes a frame in well under a millisecond on the CPU; RE-USE's GPU
-                    // calls take a few and jitter more.
-                    let margin = model == .deepFilterNet3 ? 0.015 : 0.03
-                    return try Pipeline(enhancer: enhancer, margin: margin, input: input.id, sink: sink)
+                    let enhancer = try models.enhancer(model, settings)
+                    return try Pipeline(enhancer: enhancer, margin: settings.margin(model), input: input.id, sink: sink)
                 }
             }.value
             log.notice("pipeline start took \(String(describing: ContinuousClock.now - begin), privacy: .public)")
@@ -222,10 +233,10 @@ final class Controller {
     /// Loads the selected model and compiles its kernels ahead of time, so the pipeline
     /// starts within a fraction of a second when a meeting app opens the microphone.
     private func preload() {
-        let model = model, depth = reuseDepth, frames = reuseFrames, models = models
-        guard model == .deepFilterNet3 || reuseDownloaded else { return }
+        let model = model, settings = settings, models = models
+        guard downloaded.contains(model) else { return }
         Task.detached(priority: .utility) {
-            try? models.enhancer(model, depth: depth, frames: frames).warmUp()
+            try? models.enhancer(model, settings).warmUp()
         }
     }
 
@@ -244,6 +255,30 @@ final class Controller {
         defaults.set(model.rawValue, forKey: "model")
         defaults.set(reuseDepth, forKey: "reuseDepth")
         defaults.set(reuseFrames, forKey: "reuseFrames")
+        defaults.set(nemotronChunk, forKey: "nemotronChunk")
+    }
+
+    private var settings: ModelSettings {
+        ModelSettings(reuseDepth: reuseDepth, reuseFrames: reuseFrames, nemotronChunk: nemotronChunk)
+    }
+}
+
+/// The per-model settings a pipeline is built from.
+struct ModelSettings: Sendable {
+    var reuseDepth: Int
+    var reuseFrames: Int
+    var nemotronChunk: Double
+
+    /// Slack for compute time before playback would run dry (see `RealtimeEnhancer`).
+    /// DeepFilterNet3 computes a frame in well under a millisecond on the CPU; RE-USE's
+    /// GPU calls take a few and jitter more; NemotronLabs RE-USE computes a whole chunk at
+    /// once, a few hundred milliseconds per second of 48 kHz audio at most.
+    func margin(_ model: EnhancementModel) -> Double {
+        switch model {
+        case .deepFilterNet3: 0.015
+        case .reuse: 0.03
+        case .nemotron: 0.15 + 0.25 * nemotronChunk
+        }
     }
 }
 
@@ -251,9 +286,9 @@ private let log = Logger(subsystem: "cool.jacoblin.EfficientNoiseReduction", cat
 
 /// Loaded weights, kept across pipeline restarts.
 private final class ModelCache: @unchecked Sendable {
-    private let lock = OSAllocatedUnfairLock<(DeepFilterNet3?, ReUseModel?)>(initialState: (nil, nil))
+    private let lock = OSAllocatedUnfairLock<(DeepFilterNet3?, ReUseModel?, NemotronModel?)>(initialState: (nil, nil, nil))
 
-    func enhancer(_ model: EnhancementModel, depth: Int, frames: Int) throws -> any SpeechEnhancer {
+    func enhancer(_ model: EnhancementModel, _ s: ModelSettings) throws -> any SpeechEnhancer {
         try lock.withLockUnchecked { cache in
             switch model {
             case .deepFilterNet3:
@@ -261,11 +296,15 @@ private final class ModelCache: @unchecked Sendable {
                 cache.0 = m
                 return DeepFilterNet3Enhancer(model: m, chunkFrames: 1)
             case .reuse:
-                let m = try cache.1 ?? ReUseModel(directory: ModelLocator.locate())
+                let m = try cache.1 ?? ReUseModel(directory: ModelLocator.locate(.realtimeReUse))
                 cache.1 = m
                 return try StreamingEnhancer(
                     model: m, sampleRate: 48000,
-                    configuration: .init(exitLayer: depth, lookAhead: 0, chunk: .frames(frames)))
+                    configuration: .init(exitLayer: s.reuseDepth, lookAhead: 0, chunk: .frames(s.reuseFrames)))
+            case .nemotron:
+                let m = try cache.2 ?? NemotronModel(directory: ModelLocator.locate(.nemotron))
+                cache.2 = m
+                return NemotronEnhancer(model: m, sampleRate: 48000, chunking: .chunks(seconds: s.nemotronChunk))
             }
         }
     }

@@ -102,9 +102,13 @@ private struct StatusLine: View {
         case .off: "Off"
         case .waiting: "Standby"
         case .starting: "Starting"
-        case .active: controller.latencyMs.map { "Active · \($0) ms" } ?? "Active"
+        case .active: controller.latencyMs.map { "Active · \(Self.latency($0))" } ?? "Active"
         case .failed: "Needs attention"
         }
+    }
+
+    static func latency(_ ms: Int) -> String {
+        ms < 1000 ? "\(ms) ms" : String(format: "%.1f s", Double(ms) / 1000)
     }
 
     private var color: Color {
@@ -159,7 +163,7 @@ private struct SignalFlow: View {
                         active: active, level: levels.input)
                     FlowArrow(active: active)
                     FlowNode(
-                        symbol: controller.model == .reuse ? "sparkles" : "wand.and.stars",
+                        symbol: controller.model == .deepFilterNet3 ? "wand.and.stars" : "sparkles",
                         title: controller.model.shortTitle, active: active, level: nil)
                     FlowArrow(active: active)
                     FlowNode(symbol: "person.2.wave.2.fill", title: "Meetings", active: active, level: levels.output)
@@ -277,34 +281,40 @@ private struct SettingsList: View {
                 }
                 .pickerStyle(.segmented)
             }
-            if controller.model == .reuse {
-                if controller.reuseDownloaded {
-                    SettingRow(symbol: "gauge.with.dots.needle.67percent", help: "Quality: deeper exits sound better and use more GPU") {
-                        Picker("Quality", selection: $controller.reuseDepth) {
-                            Text("Light").tag(3)
-                            Text("Balanced").tag(8)
-                            Text("Best").tag(12)
+            if !controller.downloaded.contains(controller.model) {
+                SettingRow(symbol: "arrow.down.circle", help: "Model weights") {
+                    HStack {
+                        Button(controller.downloading == controller.model ? "Downloading…" : "Download Model · \(controller.model.downloadSize)") {
+                            controller.download(controller.model)
                         }
-                        .pickerStyle(.segmented)
+                        .disabled(controller.downloading != nil)
+                        Spacer()
+                        LicenseInfo(model: controller.model)
                     }
-                    SettingRow(symbol: "timer", help: "Latency: longer chunks use less power") {
-                        Picker("Latency", selection: $controller.reuseFrames) {
-                            Text("40 ms").tag(1)
-                            Text("120 ms").tag(5)
-                        }
-                        .pickerStyle(.segmented)
+                }
+            } else if controller.model == .reuse {
+                SettingRow(symbol: "gauge.with.dots.needle.67percent", help: "Quality: deeper exits sound better and use more GPU") {
+                    Picker("Quality", selection: $controller.reuseDepth) {
+                        Text("Light").tag(3)
+                        Text("Balanced").tag(8)
+                        Text("Best").tag(12)
                     }
-                } else {
-                    SettingRow(symbol: "arrow.down.circle", help: "RE-USE weights") {
-                        HStack {
-                            Button(controller.downloading ? "Downloading…" : "Download Model · 54 MB") {
-                                controller.downloadReUse()
-                            }
-                            .disabled(controller.downloading)
-                            Spacer()
-                            LicenseInfo()
-                        }
+                    .pickerStyle(.segmented)
+                }
+                SettingRow(symbol: "timer", help: "Latency: longer chunks use less power") {
+                    Picker("Latency", selection: $controller.reuseFrames) {
+                        Text("40 ms").tag(1)
+                        Text("120 ms").tag(5)
                     }
+                    .pickerStyle(.segmented)
+                }
+            } else if controller.model == .nemotron {
+                SettingRow(symbol: "timer", help: "Latency: the model enhances a chunk at a time; longer chunks give it more context") {
+                    Picker("Latency", selection: $controller.nemotronChunk) {
+                        Text("1 s").tag(1.0)
+                        Text("2 s").tag(2.0)
+                    }
+                    .pickerStyle(.segmented)
                 }
             }
         }
@@ -331,13 +341,14 @@ private struct SettingRow<Content: View>: View {
 }
 
 private struct LicenseInfo: View {
+    let model: EnhancementModel
     @State private var shown = false
 
     var body: some View {
         Button { shown.toggle() } label: { Image(systemName: "info.circle") }
             .buttonStyle(.borderless)
             .popover(isPresented: $shown, arrowEdge: .bottom) {
-                Text("NVIDIA's Real-time RE-USE weights are licensed for noncommercial use only and are downloaded from Hugging Face.")
+                Text(model.licenseNote)
                     .font(.callout)
                     .frame(width: 220)
                     .padding(12)
@@ -379,13 +390,31 @@ extension EnhancementModel {
         switch self {
         case .deepFilterNet3: "DFN3"
         case .reuse: "RE-USE"
+        case .nemotron: "Nemotron"
         }
     }
 
     var detail: String {
         switch self {
         case .deepFilterNet3: "DeepFilterNet3: noise suppression on the CPU, built in"
-        case .reuse: "Real-time RE-USE: universal speech enhancement on the GPU"
+        case .reuse: "Real-time RE-USE: universal speech enhancement on the GPU, 40 ms"
+        case .nemotron: "NemotronLabs RE-USE: NVIDIA's highest-quality enhancement on the GPU, a second or more of delay"
+        }
+    }
+
+    var downloadSize: String {
+        switch self {
+        case .deepFilterNet3: ""
+        case .reuse: "54 MB"
+        case .nemotron: "39 MB"
+        }
+    }
+
+    var licenseNote: String {
+        switch self {
+        case .deepFilterNet3: "DeepFilterNet3 is MIT / Apache-2.0 licensed and built in."
+        case .reuse: "NVIDIA's Real-time RE-USE weights are licensed for noncommercial use only and are downloaded from Hugging Face."
+        case .nemotron: "NVIDIA's NemotronLabs RE-USE weights are released under the OpenMDW License 1.1, which allows commercial use, and are downloaded from Hugging Face."
         }
     }
 }
